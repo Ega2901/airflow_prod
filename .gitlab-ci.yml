@@ -1,0 +1,121 @@
+stages:
+  - lint
+  - test
+  - update-req
+  - deploy_test
+  - promote
+
+image: python:3.12
+
+variables:
+  AIRFLOW_VERSION: "2.10.5"
+  PROD_BRANCH:     "main"
+
+# ─────────────────────────── 1. LINT ───────────────────────────
+lint:
+  stage: lint
+  script:
+    - pip install black
+    - black --check .
+  rules:
+    - if: '$CI_COMMIT_BRANCH'         # все ветки + MR
+
+# ─────────────────────────── 2. TEST ───────────────────────────
+test_dags:
+  stage: test
+  script:
+    - pip install "apache-airflow==${AIRFLOW_VERSION}" pytest unittest2
+    - pip install -r requirements.txt
+    - python -m unittest discover -s tests
+  rules:
+    - if: '$CI_COMMIT_BRANCH'         # все ветки + MR
+
+# ──────────────────────── 3. UPDATE-REQ (main) ─────────────────
+update_req:
+  stage: update-req
+  image: docker:latest
+  services: [docker:dind]
+  variables:
+    DOCKER_DRIVER:      overlay2
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker cp ./requirements.txt ${TEST_SCHEDULER}:/opt/airflow/requirements.txt
+    - docker exec ${TEST_SCHEDULER} pip install --upgrade pip
+    - docker exec ${TEST_SCHEDULER} pip install -r /opt/airflow/requirements.txt
+    - docker restart ${TEST_SCHEDULER}
+  retry:
+    max: 2
+    when: [runner_system_failure, script_failure]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: [requirements.txt]
+    - when: never
+
+# ───────────── 4. DEPLOY → TEST-AIRFLOW (только airflow_tests) ─────────────
+deploy_to_test_airflow:
+  stage: deploy_test
+  image: docker:latest
+  services: [docker:dind]
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: "/certs"
+
+  script:
+    - docker exec ${TEST_SCHEDULER} rm -rf dags/dags/*
+    - docker cp ./dags               ${TEST_SCHEDULER}:/opt/airflow/dags
+
+    - docker exec ${TEST_SCHEDULER} mkdir -p /opt/airflow/scripts
+    - docker cp scripts/cleanup_removed_dags.sh ${TEST_SCHEDULER}:/opt/airflow/scripts/cleanup_removed_dags.sh
+
+    - docker exec --user root ${TEST_SCHEDULER} chmod +x /opt/airflow/scripts/cleanup_removed_dags.sh
+
+    - docker restart ${TEST_SCHEDULER}
+    - docker exec ${TEST_SCHEDULER} bash /opt/airflow/scripts/cleanup_removed_dags.sh
+
+  needs: [test_dags]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "airflow_tests"'
+      when: on_success
+    - when: never
+
+
+# ─────────────── 5. PROMOTE → PROD-REPO (только MR → main) ────────────────
+promote_to_prod_repo:
+  stage: promote
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache git openssh-client curl rsync
+    - mkdir -p ~/.ssh
+    - 'echo "$DEPLOY_KEY" > ~/.ssh/id_rsa'
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan armtek.gitlab.yandexcloud.net >> ~/.ssh/known_hosts
+    - git config --global user.name  "CI Bot"
+    - git config --global user.email "ci@yourdomain.com"
+  script:
+    - |
+      set -euo pipefail
+      : ${PROD_REPO_SSH:?} ${PROD_PROJECT_ID:?} ${GITLAB_TOKEN:?}
+      BR="promote-${CI_COMMIT_SHORT_SHA}"
+
+      git clone --depth 1 --branch "$PROD_BRANCH" "$PROD_REPO_SSH" prod_repo
+      rsync -av --delete dags/ prod_repo/dags/
+      cd prod_repo
+      git checkout -b "$BR"
+      git add dags
+      if git diff --cached --quiet; then
+        echo "No DAG changes → skip promote"
+        exit 0
+      fi
+      git commit -m "Promote DAGs from test repo commit ${CI_COMMIT_SHA}"
+      git push origin "$BR"
+
+      curl --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+           --data "source_branch=$BR&target_branch=${PROD_BRANCH}&title=Promote DAGs ${CI_COMMIT_SHORT_SHA}" \
+           "https://armtek.gitlab.yandexcloud.net/api/v4/projects/${PROD_PROJECT_ID}/merge_requests"
+  needs:
+    - deploy_to_test_airflow
+  when: on_success
+  rules:
+    - if: '$CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+    - when: never
